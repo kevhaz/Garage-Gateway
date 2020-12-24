@@ -40,7 +40,7 @@ byte destination = 0xAA;      // destination to send to
 //  int interval = 2000;          // interval between sends
 int  mqttErrorCount = 0;
 
-// OLED pins to ESP32 GPIOs via this connecthin:
+// OLED pins to ESP32 GPIOs via this connecting:
 //#define OLED_ADDR 0x3c
 //#define OLED_SDA  4 // GPIO4
 //#define OLED_SCL  15 // GPIO15
@@ -49,8 +49,8 @@ int  mqttErrorCount = 0;
 //SSD1306 display(OLED_ADDR, OLED_SDA, OLED_SCL);
 
 // WIFI
-const char* ssid     = "EDGECLIFF";
-const char* password = "leapfr0g";
+char *ssid      = "EDGECLIFF";               // Set your WiFi SSID
+char *password  = "leapfr0g";                // Set your WiFi password
 
 // Encryption.
 // AES Encryption Key
@@ -62,7 +62,7 @@ byte aes_iv[N_BLOCK]  = { 0x79, 0x77, 0x98, 0x90, 0xB7, 0x34, 0xC3, 0xA1, 0x4D, 
 
 
 //MQTT
-IPAddress server(10, 0, 1, 12);
+IPAddress server(192, 168, 1, 107 );
 #define MQTT_CLIENTID "GARAGEGATEWAY"
 #define MQTT_UID "garage1"
 #define MQTT_PWD "leapfr0g"
@@ -96,12 +96,26 @@ void callback(char* topic, byte* payload, unsigned int length)
     GGcommand = GGcommand + (char)payload[i];
     i++;
   }   
-  
-  Serial.print("Sending Lora Message : '");
-  Serial.print(GGcommand); 
-  Serial.println("'");
-  
-  sendMessage(GGcommand);
+
+   if ( 0==GGcommand.compareTo("PING") )
+  {
+    // Calling publish in a MQTT Callback invalidates payload
+    mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
+  } 
+  else if ( 0==GGcommand.compareTo("REBOOT") )
+  {
+    // Calling publish in a MQTT Callback invalidates payload
+    mqtt.disconnect();
+    delay(1000);
+    ESP.restart();
+  } 
+  else  
+  {
+    Serial.print("Sending Lora Message : '");
+    Serial.print(GGcommand); 
+    Serial.println("'");   
+    sendMessage(GGcommand);
+  }
   return;
 }
 
@@ -164,9 +178,9 @@ void acti_oLED(String msg)
   display.setFont(ArialMT_Plain_16);
   display.drawString(0, 16, msg.c_str());
   display.display();
+  Serial.print("OLED: Displaying: ");
 #endif
 
-  Serial.print("OLED: Displaying: ");
   Serial.println(msg);
 }
 
@@ -188,9 +202,9 @@ void msg_oLED(int rssi, float snr, String packet) {
     display.drawString(0, 0, packet );
     display.drawString(0, 16, String(szBuf));
     display.display();
+    Serial.print("OLED: Displaying: ");
 #endif
     
-    Serial.print("OLED: Displaying: ");
     Serial.println(szBuf);
     
 }
@@ -267,7 +281,7 @@ void aes_init() {
 String encrypt(char * msg, byte iv[]) {  
   int msgLen = strlen(msg);
   char encrypted[2 * msgLen];
-  aesLib.encrypt64(msg, encrypted, aes_key, iv);  
+  aesLib.encrypt64(msg, msgLen, encrypted, aes_key, sizeof(aes_key), iv);  
   return String(encrypted);
 }
 
@@ -279,7 +293,7 @@ String decrypt(char * msg, byte iv[]) {
   //unsigned long ms = micros();
   int msgLen = strlen(msg);
   char decrypted[msgLen]; // half may be enough
-  aesLib.decrypt64(msg, decrypted, aes_key, iv);  
+  aesLib.decrypt64(msg, msgLen, decrypted, aes_key, sizeof(aes_key), iv);  
   return String(decrypted);
 }
 
@@ -288,31 +302,44 @@ void setup() {
   Serial.begin(115200);
   aes_init();
 
-  Serial.println("\nLoRa Duplex");
+  Serial.println("\nLoRa Duplex - Garage Gateway");
   // Set up Display
   init_oLED();
 
   acti_oLED( "Connecting to WiFi" );
 
+  delay(200);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+  delay(1000);
+  WiFi.disconnect(true);
+  delay(1000);
+  WiFi.mode(WIFI_STA);
   WiFi.setHostname("garagegateway");
+  
+  WiFi.begin(ssid, password);
 
-  int wifiErrorCount = 0;
+
+  int wifierrorcount = 0;
   while (WiFi.status() != WL_CONNECTED) {
-    if (wifiErrorCount > 20)
-    {
+    delay(5000);
+    Serial.print(".");
+    if (wifierrorcount > 10 ) {
       ESP.restart();
     }
-    wifiErrorCount++;
-    acti_oLED( "Wifi-Error Wait." );
-    delay(1000);
-    acti_oLED( "Connecting to WiFi" );
-    Serial.print(".");
-  } 
+    wifierrorcount++;
+  }
 
-  Serial.print("Wifi Connected at IP: ");
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
+  //Serial.print("Hostname  : ");
+  //Serial.println(WiFi.getHostname());
 
   acti_oLED( "Connect to MQTT..." );  
 
@@ -435,17 +462,19 @@ void onReceive(int packetSize) {
     //return;                             // skip rest of function
   }
 
-  // create an object
-  //DynamicJsonBuffer jsonBuffer;
-  StaticJsonBuffer<512> jsonBuffer;
-    
-  JsonObject& object1 = jsonBuffer.parseObject(decrypted);
-  object1["rssi"] = String(LoRa.packetRssi());
-  object1["snr"] = String(LoRa.packetSnr());
+  DynamicJsonDocument jsonBuffer(200);
+  DeserializationError error = deserializeJson(jsonBuffer, decrypted); 
+  // Test if parsing succeeds.
+  if (error) {
+    Serial.println("parseObject() failed");
+    return;
+  }
 
+  jsonBuffer["rssi"] = String(LoRa.packetRssi());
+  jsonBuffer["snr"] = String(LoRa.packetSnr());
 
   // if the recipient isn't this for this device or broadcast
-  byte recipient = object1[String("to")];
+  byte recipient = jsonBuffer[String("to")];
   if (recipient != localAddress ) { // && recipient != 0xe3) {
     Serial.print("warning: This message to '" );
     Serial.print( recipient );
@@ -459,11 +488,11 @@ void onReceive(int packetSize) {
   Serial.println("Snr: " + String(LoRa.packetSnr()));
   Serial.println();
 
-
   // Now sent message through MQTT
   char jsonChar[512];
-  object1.printTo((char*)jsonChar, object1.measureLength() + 1);  
-
+  
+  //jsonBuffer.printTo((char*)jsonChar, jsonBuffer.measureLength() + 1);  
+  serializeJson( jsonBuffer, jsonChar, 512 );
   Serial.print( "MQTT=" );
   Serial.println( jsonChar );
   // E.g: {"rx_from":"aa","tx_to":"bb","msg_id":"160","msg_len":"16","rssi":"-26","snr":"9.75","msg":"count=9632 GD=UP"}
