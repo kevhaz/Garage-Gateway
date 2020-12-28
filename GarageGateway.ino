@@ -17,6 +17,7 @@
 #define MQTT_MAX_PACKET_SIZE 512
 
 #define INCLUDE_LORA
+//#define INCLUDE_SECURITY
 
 //#include <SPI.h>              // include libraries
 //#include <Wire.h>
@@ -36,17 +37,7 @@ String outgoing;              // outgoing message
 byte msgCount = 0;            // count of outgoing messages
 byte localAddress = 0xBB;     // address of this device
 byte destination = 0xAA;      // destination to send to
-//  long lastSendTime = 0;        // last send time
-//  int interval = 2000;          // interval between sends
 int  mqttErrorCount = 0;
-
-// OLED pins to ESP32 GPIOs via this connecting:
-//#define OLED_ADDR 0x3c
-//#define OLED_SDA  4 // GPIO4
-//#define OLED_SCL  15 // GPIO15
-//#define OLED_RST  16 // GPIO16
-
-//SSD1306 display(OLED_ADDR, OLED_SDA, OLED_SCL);
 
 // WIFI
 char *ssid      = "EDGECLIFF";               // Set your WiFi SSID
@@ -60,6 +51,16 @@ AESLib aesLib;
 byte aes_key[]        = { 0xB4, 0x18, 0x3C, 0x1F, 0x38, 0x86, 0x2A, 0x40, 0xD3, 0x88, 0xFA, 0x28, 0x6B, 0xF3, 0x8A, 0x33 };
 byte aes_iv[N_BLOCK]  = { 0x79, 0x77, 0x98, 0x90, 0xB7, 0x34, 0xC3, 0xA1, 0x4D, 0x20, 0xE0, 0x10, 0x43, 0x3F, 0xC1, 0x2F };
 
+
+// GARAGE DOOR STATUS -> This is what we think the garage door is doing.
+typedef enum {
+   DS_ERROR,
+   DS_OPEN,
+   DS_OPENING,
+   DS_CLOSING,
+   DS_CLOSED,
+   DS_UNKNOWN
+} DOORSTATUS;
 
 //MQTT
 IPAddress server(192, 168, 1, 107 );
@@ -86,9 +87,10 @@ PubSubClient mqtt(server, 1883, callback, wifiClient);
 // ----------------------------------------------------------------
 void callback(char* topic, byte* payload, unsigned int length) 
 { 
-  // If we get here we have received a message to open or close the garage door 
-  Serial.println("MQTT Command Message received");
-
+  // If we get here we have received a message to open or close the garage door which is acheived by sending
+  // the message over LoRa to the GARAGEDOOR_SENSOR
+  Serial.print("MQTT Command Message received: ");
+  
   String GGcommand = "";
   int i = 0;
   
@@ -96,6 +98,7 @@ void callback(char* topic, byte* payload, unsigned int length)
     GGcommand = GGcommand + (char)payload[i];
     i++;
   }   
+  Serial.println(GGcommand);
 
    if ( 0==GGcommand.compareTo("PING") )
   {
@@ -111,6 +114,9 @@ void callback(char* topic, byte* payload, unsigned int length)
   } 
   else  
   {
+    // Send command, but wrap it up in a defined message:
+    char message[128];
+    sprintf( message, "{frm:%d,to:%d,cmd:\"%s\"}", localAddress, destination, GGcommand.c_str()); 
     Serial.print("Sending Lora Message : '");
     Serial.print(GGcommand); 
     Serial.println("'");   
@@ -138,87 +144,35 @@ int publishMQTT(String topic, String message) {
   return bOk;
 }
 
-// ----------------------------------------------------------------  
-// Initilize the OLED functions.
-//
 // ----------------------------------------------------------------
-
-void init_oLED() 
+//
+// Convert Door Status erum to printable value
+// ----------------------------------------------------------------
+String doorStatusToString( const DOORSTATUS status )
 {
-#if defined OLED_RST
-  Serial.println("OLED: Reseting");
-  pinMode(OLED_RST,OUTPUT);
-  digitalWrite(OLED_RST, LOW);  // low to reset OLED
-  delay(50); 
-  digitalWrite(OLED_RST, HIGH);   // must be high to turn on OLED
-  delay(50);
-
-  // Initialising the UI will init the display too.
-  Serial.println("OLED: Init");
-  display.init();
-  display.flipScreenVertically();
-  display.setFont(ArialMT_Plain_24);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(0, 24, "STARTING");
-  display.display();
-  Serial.println("OLED: Init Complete");
-#endif
-}
-
-// ----------------------------------------------------------------
-// Activate the OLED
-//
-// ----------------------------------------------------------------
-void acti_oLED(String msg) 
-{
-#if defined OLED_RST  
-  // Initialising the UI will init the display too.
-  display.clear();
-  
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(0, 16, msg.c_str());
-  display.display();
-  Serial.print("OLED: Displaying: ");
-#endif
-
-  Serial.println(msg);
-}
-
-
-// ----------------------------------------------------------------
-// Print the received message message on the OLED.
-// Note: The whole message must fit in the buffer
-//
-// ----------------------------------------------------------------
-void msg_oLED(int rssi, float snr, String packet) {
-    
-    char szBuf[40];
-    sprintf(szBuf, "R:%i, S:%.0fdB", rssi, snr);
-
- #if defined OLED_RST
-    display.clear();
-    display.setFont(ArialMT_Plain_16);
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(0, 0, packet );
-    display.drawString(0, 16, String(szBuf));
-    display.display();
-    Serial.print("OLED: Displaying: ");
-#endif
-    
-    Serial.println(szBuf);
-    
-}
-
-// ----------------------------------------------------------------
-// Print the OLED address in use
-//
-// ----------------------------------------------------------------
-void addr_oLED() 
-{
-#if defined OLED_RST  
-  Serial.print(F("OLED_ADDR=0x"));
-  Serial.println(OLED_ADDR, HEX);
-#endif
+  String retVal;
+  switch ( status )
+  {
+    case DS_ERROR:
+       retVal = "Error";
+       break;
+     case DS_OPEN:
+       retVal = "Open";
+       break;
+     case DS_OPENING:
+       retVal = "Opening";
+       break;
+     case DS_CLOSED:
+       retVal = "Closed";
+       break;
+     case DS_CLOSING:
+       retVal = "Closing";
+       break;
+     default:
+       retVal = "Unknown";
+       break;    
+  }
+  return retVal;
 }
 
 void mqttPrintDebug(short status, boolean nl = false)
@@ -269,9 +223,12 @@ void mqttPrintDebug(short status, boolean nl = false)
 // Generate IV (once)
 // ----------------------------------------------------------------
 void aes_init() {
+#ifdef INCLUDE_SECURITY
   aesLib.gen_iv(aes_iv);
   // workaround for incorrect B64 functionality on first run...
   encrypt("HELLO WORLD!", aes_iv);
+#endif
+  return;
 }
 
 // ----------------------------------------------------------------
@@ -279,10 +236,14 @@ void aes_init() {
 // Encrypt Message
 // ----------------------------------------------------------------
 String encrypt(char * msg, byte iv[]) {  
+#ifdef INCLUDE_SECURITY
   int msgLen = strlen(msg);
-  char encrypted[2 * msgLen];
+  char encrypted[4 * msgLen];
   aesLib.encrypt64(msg, msgLen, encrypted, aes_key, sizeof(aes_key), iv);  
   return String(encrypted);
+#else
+  return String(msg);
+#endif
 }
 
 // ----------------------------------------------------------------
@@ -290,11 +251,14 @@ String encrypt(char * msg, byte iv[]) {
 // Decrypt Message
 // ----------------------------------------------------------------
 String decrypt(char * msg, byte iv[]) {
-  //unsigned long ms = micros();
+#ifdef INCLUDE_SECURITY
   int msgLen = strlen(msg);
   char decrypted[msgLen]; // half may be enough
   aesLib.decrypt64(msg, msgLen, decrypted, aes_key, sizeof(aes_key), iv);  
   return String(decrypted);
+#else
+  return String(msg);
+#endif
 }
 
 void setup() {
@@ -303,10 +267,6 @@ void setup() {
   aes_init();
 
   Serial.println("\nLoRa Duplex - Garage Gateway");
-  // Set up Display
-  init_oLED();
-
-  acti_oLED( "Connecting to WiFi" );
 
   delay(200);
   Serial.println();
@@ -341,19 +301,17 @@ void setup() {
   //Serial.print("Hostname  : ");
   //Serial.println(WiFi.getHostname());
 
-  acti_oLED( "Connect to MQTT..." );  
-
   // MQTT
   if (mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false)) {
     mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
     mqtt.subscribe(COMMANDTOPIC, 1);
     Serial.println("MQTT Connected");
     mqttErrorCount = 0; 
-    acti_oLED( "GG Ready" );  
+ 
   } else {
     Serial.print("MQTT Not Connected: ");  
     mqttPrintDebug( mqtt.state(), true );
-    acti_oLED( "MQTT Error" );     
+    
   }
 
  #ifdef INCLUDE_LORA
@@ -368,7 +326,11 @@ void setup() {
   }
 
   LoRa.setSyncWord(0xe3);
- #endif
+#endif
+
+  sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  sntp_setservername(0, "pool.ntp.org");
+  sntp_init();
  
   Serial.println("Ready.");
 }
@@ -385,20 +347,17 @@ void loop() {
       mqttPrintDebug( mqtt.state(), false );
       Serial.print("'"); 
       
-      acti_oLED( "MQTT Recon Err" );
       mqttErrorCount++; 
 
       if (mqttErrorCount > 5 )
       {
-         acti_oLED( "Rst due to MQTT" );
          delay(10000);
          ESP.restart();
       }
 
       if (WiFi.status() != WL_CONNECTED )
       {
-        Serial.print( "Connectivity Error: Restarting in 10s");
-        acti_oLED( "Restart in 10s." );             
+        Serial.print( "Connectivity Error: Restarting in 10s");    
         delay(10000);
         ESP.restart();
       }
@@ -408,7 +367,6 @@ void loop() {
     } else {
       mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
       mqtt.subscribe(COMMANDTOPIC,1);
-      acti_oLED( "GG Ready." );
       mqttErrorCount = 0;  
     }
   } else {
@@ -462,7 +420,7 @@ void onReceive(int packetSize) {
     //return;                             // skip rest of function
   }
 
-  DynamicJsonDocument jsonBuffer(200);
+  DynamicJsonDocument jsonBuffer(512);
   DeserializationError error = deserializeJson(jsonBuffer, decrypted); 
   // Test if parsing succeeds.
   if (error) {
@@ -491,11 +449,11 @@ void onReceive(int packetSize) {
   // Now sent message through MQTT
   char jsonChar[512];
   
-  //jsonBuffer.printTo((char*)jsonChar, jsonBuffer.measureLength() + 1);  
+  jsonBuffer["ds"] = doorStatusToString( (DOORSTATUS)jsonBuffer["ds"] );
   serializeJson( jsonBuffer, jsonChar, 512 );
   Serial.print( "MQTT=" );
   Serial.println( jsonChar );
-  // E.g: {"rx_from":"aa","tx_to":"bb","msg_id":"160","msg_len":"16","rssi":"-26","snr":"9.75","msg":"count=9632 GD=UP"}
+  // E.g: {"from":"aa","tx":"bb","msg_id":"160","msg_len":"16","rssi":"-26","snr":"9.75","ds"="OPEN"}
   int status = publishMQTT( SENDTOPIC, jsonChar );
  
  #endif
