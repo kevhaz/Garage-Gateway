@@ -1,23 +1,9 @@
-/*
-  LoRa Duplex communication
-
-  Sends a message every half second, and polls continually
-  for new incoming messages. Implements a one-byte addressing scheme,
-  with 0xFF as the broadcast address.
-
-  Uses readString() from Stream class to read payload. The Stream class'
-  timeout may affect other functuons, like the radio's callback. For an
-
-  created 28 April 2017
-  by Tom Igoe
-*/
 
 #define MQTT_SOCKET_TIMEOUT 30
 #define MQTT_KEEPALIVE 30
 #define MQTT_MAX_PACKET_SIZE 512
 
 #define INCLUDE_LORA
-//#define INCLUDE_SECURITY
 
 //#include <SPI.h>              // include libraries
 //#include <Wire.h>
@@ -27,6 +13,16 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <AESLib.h>
+#include "gg_time.h"
+#include "security.h"
+#include "SysLogger.h"
+
+#define DS_50 0.5
+#define DS_25 0.25
+#define DS_75 0.75
+
+#define PIN_ERROR       4 
+#define PIN_ACTIVITY    23
 
 const int csPin = 18;          // LoRa radio chip select
 const int resetPin = 14;       // LoRa radio reset
@@ -40,17 +36,11 @@ byte destination = 0xAA;      // destination to send to
 int  mqttErrorCount = 0;
 
 // WIFI
-char *ssid      = "EDGECLIFF";               // Set your WiFi SSID
-char *password  = "leapfr0g";                // Set your WiFi password
-
-// Encryption.
-// AES Encryption Key
-AESLib aesLib;
-
-// salt=25B61CA381BF15AC
-byte aes_key[]        = { 0xB4, 0x18, 0x3C, 0x1F, 0x38, 0x86, 0x2A, 0x40, 0xD3, 0x88, 0xFA, 0x28, 0x6B, 0xF3, 0x8A, 0x33 };
-byte aes_iv[N_BLOCK]  = { 0x79, 0x77, 0x98, 0x90, 0xB7, 0x34, 0xC3, 0xA1, 0x4D, 0x20, 0xE0, 0x10, 0x43, 0x3F, 0xC1, 0x2F };
-
+const int ssids = 2;
+char *ssid[ssids]      = { "EDGECLIFF_24G_HA1", "EDGECLIFF" };             // Set your WiFi SSID
+char *password[ssids]  = { "ha1Leapfr0g",       "leapfr0g"  };             // Set your WiFi password
+IPAddress my_ip;
+int nssid = 0;
 
 // GARAGE DOOR STATUS -> This is what we think the garage door is doing.
 typedef enum {
@@ -79,7 +69,30 @@ WiFiClient wifiClient;
 
 PubSubClient mqtt(server, 1883, callback, wifiClient);
 
+// Rmemote Logging Classes
+#define SYSLOGFILE "garagegateway"
+#define SYSLOGDHOST "192.168.1.107"
+#define SYSLOGDPORT 514
+SysLogger *errorLog;
+SysLogger *warningLog;
+SysLogger *noticeLog;
+SysLogger *debugLog;
+SysLogger *infoLog;
 
+//#define USE_COLOUR 1
+#ifdef USE_COLOUR
+  #define ERROR_COL "\033[0;31m"
+  #define WARNING_COL "\033[0;33m"
+  #define NOTICE_COL "\033[0;36m"
+  #define DEBUG_COL "\033[0;32m"
+  #define INFO_COL "\033[0;34m"
+#else
+  #define ERROR_COL ""
+  #define WARNING_COL ""
+  #define NOTICE_COL ""
+  #define DEBUG_COL ""
+  #define INFO_COL ""
+#endif
 
 // ----------------------------------------------------------------  
 // MQTT Call back function
@@ -87,9 +100,8 @@ PubSubClient mqtt(server, 1883, callback, wifiClient);
 // ----------------------------------------------------------------
 void callback(char* topic, byte* payload, unsigned int length) 
 { 
-  // If we get here we have received a message to open or close the garage door which is acheived by sending
+  // If we get here we have received a message to open or close the garage door which is achieved by sending
   // the message over LoRa to the GARAGEDOOR_SENSOR
-  Serial.print("MQTT Command Message received: ");
   
   String GGcommand = "";
   int i = 0;
@@ -97,17 +109,16 @@ void callback(char* topic, byte* payload, unsigned int length)
   while (i < length) {
     GGcommand = GGcommand + (char)payload[i];
     i++;
-  }   
-  Serial.println(GGcommand);
+  }  
 
-   if ( 0==GGcommand.compareTo("PING") )
+  if ( 0==GGcommand.compareTo("PING") )
   {
     // Calling publish in a MQTT Callback invalidates payload
     mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
   } 
   else if ( 0==GGcommand.compareTo("REBOOT") )
   {
-    // Calling publish in a MQTT Callback invalidates payload
+    infoLog->println("Rebootting due to command message");
     mqtt.disconnect();
     delay(1000);
     ESP.restart();
@@ -115,12 +126,11 @@ void callback(char* topic, byte* payload, unsigned int length)
   else  
   {
     // Send command, but wrap it up in a defined message:
+    // we send the time of day to the device
     char message[128];
-    sprintf( message, "{frm:%d,to:%d,cmd:\"%s\"}", localAddress, destination, GGcommand.c_str()); 
-    Serial.print("Sending Lora Message : '");
-    Serial.print(GGcommand); 
-    Serial.println("'");   
-    sendMessage(GGcommand);
+    sprintf( message, "{frm:%d,to:%d,cmd:\"%s\",ts:\"%s\"}", localAddress, destination, GGcommand.c_str(), getClock().c_str()); 
+    infoLog->printf("Sending MQTT Message via Lora: \"%s\"\n", message );   
+    sendMessage(message);
   }
   return;
 }
@@ -134,12 +144,14 @@ int publishMQTT(String topic, String message) {
   int bOk = false;
   
   if (mqtt.connected()) {
+    digitalWrite( PIN_ACTIVITY, HIGH );
     Serial.print("Sending MQTT Message...");
     bOk = mqtt.publish(topic.c_str(), message.c_str());
-    (bOk)?Serial.println("Sent!"):Serial.println("Sent with error!");
+    digitalWrite( PIN_ACTIVITY, LOW );
   } else {
-    Serial.println("MQTT Issue: Not connected. Unable to publish message");
+    errorLog->println("MQTT Issue: Not connected. Unable to publish message");
     bOk = 0;
+    flashError( 2000, DS_50, 3);
   }
   return bOk;
 }
@@ -175,131 +187,125 @@ String doorStatusToString( const DOORSTATUS status )
   return retVal;
 }
 
-void mqttPrintDebug(short status, boolean nl = false)
+String mqttDebugString(short status)
 {
+    String retVal = "";
     switch(status) {
     case MQTT_CONNECTION_TIMEOUT:
-      Serial.print( "Connection Timeout");
+      retVal = "Connection Timeout";
       break;
     case MQTT_CONNECTION_LOST:
-      Serial.print( "Connection Lost");
+      retVal = "Connection Lost";
       break;
     case MQTT_CONNECT_FAILED:
-      Serial.print( "Connection Failed");
+      retVal = "Connection Failed";
       break;
     case MQTT_DISCONNECTED:
-      Serial.print( "Disconected");
+      retVal = "Disconected";
       break;
     case MQTT_CONNECTED:
-      Serial.print( "Connected");
+      retVal = "Connected";
       break;           
     case MQTT_CONNECT_BAD_PROTOCOL: 
-      Serial.print( "Bad Protocol");
+      retVal = "Bad Protocol";
       break;  
     case MQTT_CONNECT_BAD_CLIENT_ID: 
-      Serial.print( "Bad Client Id"); 
+      retVal = "Bad Client Id"; 
       break;
     case MQTT_CONNECT_UNAVAILABLE:
-      Serial.print( "Connect Unavailable");
+      retVal = "Connect Unavailable";
       break;    
     case MQTT_CONNECT_BAD_CREDENTIALS: 
-      Serial.print( "Bad Credentials");
+      retVal = "Bad Credentials";
       break;
     case MQTT_CONNECT_UNAUTHORIZED: 
-      Serial.print( "Connect Unauthorized");
+      retVal = "Connect Unauthorised";
       break;  
     default:
-      Serial.print( "Unknown status");  
+      retVal = "Unknown status";  
       break; 
   }
-  if (nl)
-    Serial.print("\n");
-    
-  return;
+  return retVal;
 }
 
-// ----------------------------------------------------------------
-//
-// Generate IV (once)
-// ----------------------------------------------------------------
-void aes_init() {
-#ifdef INCLUDE_SECURITY
-  aesLib.gen_iv(aes_iv);
-  // workaround for incorrect B64 functionality on first run...
-  encrypt("HELLO WORLD!", aes_iv);
-#endif
-  return;
+void flashError( const int duration, const float dutycycle, const int count )
+{
+   for( int i = 0; i< count; i++ ) {
+     digitalWrite( PIN_ERROR, HIGH );
+     delay(duration * dutycycle); 
+     digitalWrite( PIN_ERROR, LOW );              
+     delay(duration * ( 1 - dutycycle) ); 
+   } // for
+   return;
 }
 
-// ----------------------------------------------------------------
-//
-// Encrypt Message
-// ----------------------------------------------------------------
-String encrypt(char * msg, byte iv[]) {  
-#ifdef INCLUDE_SECURITY
-  int msgLen = strlen(msg);
-  char encrypted[4 * msgLen];
-  aesLib.encrypt64(msg, msgLen, encrypted, aes_key, sizeof(aes_key), iv);  
-  return String(encrypted);
-#else
-  return String(msg);
-#endif
-}
-
-// ----------------------------------------------------------------
-//
-// Decrypt Message
-// ----------------------------------------------------------------
-String decrypt(char * msg, byte iv[]) {
-#ifdef INCLUDE_SECURITY
-  int msgLen = strlen(msg);
-  char decrypted[msgLen]; // half may be enough
-  aesLib.decrypt64(msg, msgLen, decrypted, aes_key, sizeof(aes_key), iv);  
-  return String(decrypted);
-#else
-  return String(msg);
-#endif
+void flashActivity( const int duration, const float dutycycle, const int count )
+{
+   for( int i = 0; i< count; i++ ) {
+     digitalWrite( PIN_ACTIVITY, HIGH );
+     delay(duration * dutycycle); 
+     digitalWrite( PIN_ACTIVITY, LOW );              
+     delay(duration * ( 1 - dutycycle) ); 
+   } // for
+   return;
 }
 
 void setup() {
   //initialize Serial Monitor
   Serial.begin(115200);
-  aes_init();
-
   Serial.println("\nLoRa Duplex - Garage Gateway");
 
-  delay(200);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+  pinMode( PIN_ERROR, OUTPUT );
+  pinMode( PIN_ACTIVITY, OUTPUT );
+  digitalWrite( PIN_ERROR, HIGH );
+  digitalWrite( PIN_ACTIVITY, HIGH );  
+  delay(500);
+  digitalWrite( PIN_ERROR, LOW );
+  digitalWrite( PIN_ACTIVITY, LOW );
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  delay(1000);
-  WiFi.disconnect(true);
-  delay(1000);
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("garagegateway");
+  security_init();
+
+  int wifierrorcount; 
+  bool connected = false;
+
+  for( nssid = 0; nssid<ssids && !connected; nssid++) {
+    wifierrorcount = 0;
+    Serial.println();
+    Serial.print("Connecting to ");
+    Serial.println(ssid[nssid]);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname("garagegateway");
+    WiFi.begin(ssid[nssid], password[nssid]);
+    delay(1000);
+
+    connected = !(WiFi.status() != WL_CONNECTED);
+    while ( !connected && wifierrorcount < 5 ) {
+      digitalWrite( PIN_ERROR, HIGH );
+      delay(4000);
+      digitalWrite( PIN_ERROR, LOW );
+      delay(1000);      
+      Serial.print(".");
+      wifierrorcount++;
+    } // while
+  } // for
   
-  WiFi.begin(ssid, password);
-
-
-  int wifierrorcount = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(5000);
-    Serial.print(".");
-    if (wifierrorcount > 10 ) {
-      ESP.restart();
-    }
-    wifierrorcount++;
+  if (!connected) {
+     WiFi.disconnect();
+     Serial.println("Forcing restart");
+     flashError( 1000, DS_50, 5 );
+     ESP.restart();
   }
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  //Serial.print("Hostname  : ");
-  //Serial.println(WiFi.getHostname());
+// Now we are ready to set up remote logging....
+  errorLog = new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Error, ERROR_COL, WiFi.getHostname(), SYSLOGFILE);
+  warningLog = new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Warning, WARNING_COL, WiFi.getHostname(), SYSLOGFILE);
+  noticeLog = new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Notice, NOTICE_COL, WiFi.getHostname(), SYSLOGFILE);
+  debugLog= new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Debug, DEBUG_COL,WiFi.getHostname(), SYSLOGFILE);
+  infoLog = new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Info, INFO_COL, WiFi.getHostname(), SYSLOGFILE);
+
+  noticeLog->println("** START UP Complete and WiFi connected **");
+  noticeLog->printf("Hostname  : %s\n",WiFi.getHostname());
 
   // MQTT
   if (mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false)) {
@@ -307,11 +313,8 @@ void setup() {
     mqtt.subscribe(COMMANDTOPIC, 1);
     Serial.println("MQTT Connected");
     mqttErrorCount = 0; 
- 
   } else {
-    Serial.print("MQTT Not Connected: ");  
-    mqttPrintDebug( mqtt.state(), true );
-    
+    errorLog->printf("MQTT Not Connected. Condition: %s\n", mqttDebugString(mqtt.state()) );
   }
 
  #ifdef INCLUDE_LORA
@@ -321,18 +324,20 @@ void setup() {
 
   if (!LoRa.begin(915E6)) {             // initialize ratio at 915 MHz
     Serial.println("LoRa init failed?");
+    digitalWrite( PIN_ERROR, HIGH );    // both read and green LED on implies LORA falure and 30 seconds to restart.
+    digitalWrite( PIN_ACTIVITY, HIGH );               
     delay(30000);
     ESP.restart();
   }
 
   LoRa.setSyncWord(0xe3);
 #endif
-
-  sntp_setoperatingmode(SNTP_OPMODE_POLL);
-  sntp_setservername(0, "pool.ntp.org");
-  sntp_init();
  
-  Serial.println("Ready.");
+  time_setup();
+ 
+  Serial.print("Ready @");
+  Serial.println(getClock());
+
 }
 
 
@@ -340,30 +345,30 @@ void loop() {
 
   if (!mqtt.connected()) {
     Serial.println( "MQTT Issue : Trying to reconnect");
-    if (!mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false )) {
-      Serial.print( "MQTT Issue (");
-      Serial.print(mqttErrorCount);
-      Serial.print(") : Unable to reconnect: '"); 
-      mqttPrintDebug( mqtt.state(), false );
-      Serial.print("'"); 
-      
-      mqttErrorCount++; 
 
+    digitalWrite( PIN_ERROR, HIGH );
+    delay(2000);
+    digitalWrite( PIN_ERROR, LOW );
+        
+    if (!mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false )) {
+      mqttErrorCount++; 
       if (mqttErrorCount > 5 )
       {
+         errorLog->println("Serious MQTT Issue. Restarting" );
+         flashError( 1000, DS_25, 3 );
          delay(10000);
          ESP.restart();
-      }
-
+      } else 
       if (WiFi.status() != WL_CONNECTED )
       {
-        Serial.print( "Connectivity Error: Restarting in 10s");    
+        errorLog->println("Serious MQTT Issue due to no WiFi. Restarting" );
+        flashError( 1000, DS_75, 5 );
         delay(10000);
         ESP.restart();
+      } else {
+        warningLog->printf("MQTT Issue. Condition: %s\n", mqttDebugString(mqtt.state()) );
+        delay( mqttErrorCount * 1000);
       }
-
-      delay( mqttErrorCount * 1000);
-
     } else {
       mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
       mqtt.subscribe(COMMANDTOPIC,1);
@@ -381,16 +386,16 @@ void loop() {
 
 void sendMessage(String outgoing) {
 
-  char message[128];
-  sprintf( message, "{cmd:'%s',seq:%d,to:%d,frm:%d}", outgoing.c_str(), msgCount, destination, localAddress );
+  digitalWrite(PIN_ACTIVITY, HIGH );
   byte enc_iv[N_BLOCK] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // iv_block gets written to, provide own fresh copy...
-  String encrypted = encrypt(message, enc_iv);
-  Serial.println( message );
-  Serial.println( encrypted );  
-  LoRa.beginPacket();                   // start packet
-  LoRa.write(strlen(message));          // add payload length
-  LoRa.print(encrypted);                // add payload
+  char ciphertext[3*INPUT_BUFFER_LIMIT] = {0}; // THIS IS OUTPUT BUFFER (FOR BASE64-ENCODED ENCRYPTED DATA)
+  uint16_t outgoing_len = outgoing.length();
+  uint16_t encrypted_len = security_encrypt((char*)outgoing.c_str(), outgoing_len, enc_iv, ciphertext);
+  LoRa.beginPacket();               // start packet
+  LoRa.write(outgoing_len);        // add payload length
+  LoRa.print(ciphertext);           // add payload
   LoRa.endPacket();  
+  digitalWrite(PIN_ACTIVITY, LOW );
 
   msgCount++;                           // increment message ID
 }
@@ -402,60 +407,65 @@ void onReceive(int packetSize) {
   byte messageLength = LoRa.read();    // incoming msg length
   String incoming = "";
 
+  digitalWrite(PIN_ACTIVITY, HIGH );
   while (LoRa.available()) {
     incoming += (char)LoRa.read();
   }
+
+  // we got a message
+  infoLog->printf("Message received. RSSI(%s dB), SNR(%s dB)\n", String(LoRa.packetRssi()), String(LoRa.packetSnr()) );
+  
   // assume incomming is encrypted
   // Decrypt
+  char cleartext[INPUT_BUFFER_LIMIT] = {0}; // THIS IS INPUT BUFFER (FOR TEXT)
   byte dec_iv[N_BLOCK] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // iv_block gets written to, provide own fresh copy...
-  String decrypted = decrypt((char*)incoming.c_str(), dec_iv);  
-  Serial.print("Decrypted: ");
-  Serial.println( decrypted );
+  uint16_t decrypted_len = security_decrypt((byte*)incoming.c_str(), incoming.length(), dec_iv, cleartext);  
 
-  if (messageLength != decrypted.length()) {  // check length for error
-    Serial.print("warning: message length does not match length: ");
-    Serial.print( messageLength );
-    Serial.print(" decrypted len was: "); 
-    Serial.println( decrypted.length() );
-    //return;                             // skip rest of function
+  if (messageLength != decrypted_len) {  // check length for error
+    warningLog->printf("warning: message length does not match length: %d. Decrypted Len was %d. Truncating\n", messageLength, decrypted_len);
+    if (decrypted_len>messageLength) 
+    {
+      cleartext[messageLength] = '\0';
+    }
+    //return;       
   }
+
+  infoLog->printf( "Lora Message Received: \"%s\"\n", cleartext );
 
   DynamicJsonDocument jsonBuffer(512);
-  DeserializationError error = deserializeJson(jsonBuffer, decrypted); 
+  DeserializationError error = deserializeJson(jsonBuffer, cleartext); 
   // Test if parsing succeeds.
   if (error) {
-    Serial.println("parseObject() failed");
+    warningLog->println("Unable to parse received data");
+    digitalWrite(PIN_ACTIVITY, LOW );
     return;
   }
+  digitalWrite(PIN_ACTIVITY, LOW );
 
   jsonBuffer["rssi"] = String(LoRa.packetRssi());
   jsonBuffer["snr"] = String(LoRa.packetSnr());
+  jsonBuffer["ts"] = getClock();
 
   // if the recipient isn't this for this device or broadcast
   byte recipient = jsonBuffer[String("to")];
   if (recipient != localAddress ) { // && recipient != 0xe3) {
-    Serial.print("warning: This message to '" );
-    Serial.print( recipient );
-    Serial.println("'; is not for me.");
+    warningLog->printf("warning: The message to %s is not for me", recipient );
+    digitalWrite(PIN_ACTIVITY, LOW );
     return;                             // skip rest of function
   }
+  digitalWrite(PIN_ACTIVITY, LOW );
 
   // if message is for this device, or broadcast, print details:
-  Serial.println("Message: " + decrypted);
-  Serial.println("RSSI: " + String(LoRa.packetRssi()));
-  Serial.println("Snr: " + String(LoRa.packetSnr()));
-  Serial.println();
+  // infoLog->printf( "Lora Message Received: \"%s\"\n", cleartext );
 
   // Now sent message through MQTT
   char jsonChar[512];
   
   jsonBuffer["ds"] = doorStatusToString( (DOORSTATUS)jsonBuffer["ds"] );
   serializeJson( jsonBuffer, jsonChar, 512 );
-  Serial.print( "MQTT=" );
-  Serial.println( jsonChar );
-  // E.g: {"from":"aa","tx":"bb","msg_id":"160","msg_len":"16","rssi":"-26","snr":"9.75","ds"="OPEN"}
-  int status = publishMQTT( SENDTOPIC, jsonChar );
+  infoLog->printf( "Sending MQTT Message=\"%s\"\n", jsonChar );
+
+  int status = publishMQTT( SENDTOPIC, jsonChar ); // this will also flash the activity light
  
  #endif
 }
-
