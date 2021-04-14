@@ -1,13 +1,13 @@
+// The mother of all embedded development...
+#include <Arduino.h>
 
 #define MQTT_SOCKET_TIMEOUT 30
 #define MQTT_KEEPALIVE 30
 #define MQTT_MAX_PACKET_SIZE 512
 
+#define TTGO_V2116 
 #define INCLUDE_LORA
 
-//#include <SPI.h>              // include libraries
-//#include <Wire.h>
-//#include <SSD1306.h>
 #include <LoRa.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -16,17 +16,35 @@
 #include "gg_time.h"
 #include "security.h"
 #include "SysLogger.h"
+#include <Wire.h>
+#ifdef TTGO_V2116
+#include "display.h"
+#endif 
 
 #define DS_50 0.5
 #define DS_25 0.25
 #define DS_75 0.75
 
+// These constants are defined so we can use LORA
+#ifdef TTGO_V2116
+
+#define LORA_SS   18
+#define LORA_RST  23
+#define LORA_DIO0 26
+
+#define PIN_ERROR       15 
+#define PIN_ACTIVITY    12
+
+#else // for TTGO V1.1 or Heltech
+
+#define LORA_SS   18
+#define LORA_RST  14
+#define LORA_DIO0 26
+
 #define PIN_ERROR       4 
 #define PIN_ACTIVITY    23
+#endif
 
-const int csPin = 18;          // LoRa radio chip select
-const int resetPin = 14;       // LoRa radio reset
-const int irqPin = 26;         // change for your board; must be a hardware interrupt pin
 
 String outgoing;              // outgoing message
 
@@ -55,7 +73,7 @@ typedef enum {
 //MQTT
 IPAddress server(192, 168, 1, 107 );
 #define MQTT_CLIENTID "GARAGEGATEWAY"
-#define MQTT_UID "garage1"
+#define MQTT_UID "garage"
 #define MQTT_PWD "leapfr0g"
 #define SENDTOPIC "GARAGEGATEWAY/status"
 #define COMMANDTOPIC "GARAGEGATEWAY/command"
@@ -66,6 +84,8 @@ IPAddress server(192, 168, 1, 107 );
 // MQTT Call back function on subsctibed topic
 void callback(char*, byte*, unsigned int);
 WiFiClient wifiClient;
+
+#define HOST_NAME "garagegateway"
 
 PubSubClient mqtt(server, 1883, callback, wifiClient);
 
@@ -93,6 +113,46 @@ SysLogger *infoLog;
   #define DEBUG_COL ""
   #define INFO_COL ""
 #endif
+
+// Onscreen Information
+String os_header = "Lora Gateway";
+String os_lastAction = "";
+String os_Detail1 = "";
+String os_Detail2 = "";
+
+// scan I2C bus for devices like ssd1306 oled
+void scanI2Cdevice(void)
+{
+    byte err, addr;
+    int nDevices = 0;
+    for (addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        err = Wire.endTransmission();
+        if (err == 0) {
+            Serial.print("I2C device found at address 0x");
+            if (addr < 16)
+                Serial.print("0");
+            Serial.print(addr, HEX);
+            Serial.println(" !");
+            nDevices++;
+
+            if (addr == 0x3C) {
+                //ssd1306_found = true;
+                Serial.println("ssd1306 display found");
+            }
+
+        } else if (err == 4) {
+            Serial.print("Unknow error at address 0x");
+            if (addr < 16)
+                Serial.print("0");
+            Serial.println(addr, HEX);
+        }
+    }
+    if (nDevices == 0)
+        Serial.println("No I2C devices found\n");
+    else
+        Serial.println("done\n");
+}
 
 // ----------------------------------------------------------------  
 // MQTT Call back function
@@ -131,6 +191,10 @@ void callback(char* topic, byte* payload, unsigned int length)
     sprintf( message, "{frm:%d,to:%d,cmd:\"%s\",ts:\"%s\"}", localAddress, destination, GGcommand.c_str(), getClock().c_str()); 
     infoLog->printf("Sending MQTT Message via Lora: \"%s\"\n", message );   
     sendMessage(message);
+
+    os_lastAction = "MQTT Msg Sent";
+    os_Detail1 = GGcommand;
+    os_Detail2 = getClock();
   }
   return;
 }
@@ -145,7 +209,7 @@ int publishMQTT(String topic, String message) {
   
   if (mqtt.connected()) {
     digitalWrite( PIN_ACTIVITY, HIGH );
-    Serial.print("Sending MQTT Message...");
+    infoLog->printf("Sending MQTT Message...");
     bOk = mqtt.publish(topic.c_str(), message.c_str());
     digitalWrite( PIN_ACTIVITY, LOW );
   } else {
@@ -186,6 +250,27 @@ String doorStatusToString( const DOORSTATUS status )
   }
   return retVal;
 }
+
+// ----------------------------------------------------------------
+//
+// Update the screen with metrics info
+// ----------------------------------------------------------------
+void updateDisplay()
+{
+   String scndLine;
+   String thrdLine;
+   String frthLine;
+   String fithLine;
+
+   scndLine = "Last Action:";
+   thrdLine = os_lastAction;
+   frthLine = os_Detail1;
+   fithLine = os_Detail2;
+#ifdef USE_DISPLAY   
+   display_Lines( os_header, scndLine, thrdLine, frthLine, fithLine );
+#endif
+}
+
 
 String mqttDebugString(short status)
 {
@@ -273,9 +358,8 @@ void setup() {
     Serial.println();
     Serial.print("Connecting to ");
     Serial.println(ssid[nssid]);
-
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname("garagegateway");
+    WiFi.setHostname(HOST_NAME);
     WiFi.begin(ssid[nssid], password[nssid]);
     delay(1000);
 
@@ -289,7 +373,7 @@ void setup() {
       wifierrorcount++;
     } // while
   } // for
-  
+
   if (!connected) {
      WiFi.disconnect();
      Serial.println("Forcing restart");
@@ -304,23 +388,28 @@ void setup() {
   debugLog= new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Debug, DEBUG_COL,WiFi.getHostname(), SYSLOGFILE);
   infoLog = new SysLogger(SYSLOGDHOST, SYSLOGDPORT, LogLevel::Info, INFO_COL, WiFi.getHostname(), SYSLOGFILE);
 
-  noticeLog->println("** START UP Complete and WiFi connected **");
+  noticeLog->println("** START UP Complete");
   noticeLog->printf("Hostname  : %s\n",WiFi.getHostname());
 
-  // MQTT
-  if (mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false)) {
-    mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
-    mqtt.subscribe(COMMANDTOPIC, 1);
-    Serial.println("MQTT Connected");
-    mqttErrorCount = 0; 
-  } else {
-    errorLog->printf("MQTT Not Connected. Condition: %s\n", mqttDebugString(mqtt.state()) );
-  }
-
+  bool mqttconnected = false;
+  if (connected) {
+    // MQTT
+    if (mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false)) {
+      mqtt.publish(SERVICETOPIC, SERVICE_ALIVE);
+      mqtt.subscribe(COMMANDTOPIC, 1);
+      Serial.println("MQTT Connected");
+      infoLog->printf("MQTT Connected");
+      mqttErrorCount = 0; 
+      mqttconnected = true;
+    } else {
+      errorLog->printf("MQTT Not Connected. Condition: %s\n", mqttDebugString(mqtt.state()) );
+      mqttconnected = false;
+    }
+  } 
+  
  #ifdef INCLUDE_LORA
-
   // override the default CS, reset, and IRQ pins (optional)
-  LoRa.setPins(csPin, resetPin, irqPin);// set CS, reset, IRQ pin
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0); // set CS, reset, IRQ pin
 
   if (!LoRa.begin(915E6)) {             // initialize ratio at 915 MHz
     Serial.println("LoRa init failed?");
@@ -329,26 +418,37 @@ void setup() {
     delay(30000);
     ESP.restart();
   }
-
+  LoRa.enableCrc();
+  LoRa.setSpreadingFactor(10);
+  //LoRa.setTxPower(19);
+  //LoRa.setGain(6);
   LoRa.setSyncWord(0xe3);
 #endif
  
   time_setup();
+
+#ifdef USE_DISPLAY
+  init_Display();
+  display_Lines( "READY" );
+#endif
  
   Serial.print("Ready @");
   Serial.println(getClock());
 
+  delay(1000);
+  Serial.flush();
 }
 
 
 void loop() {
 
   if (!mqtt.connected()) {
-    Serial.println( "MQTT Issue : Trying to reconnect");
+    warningLog->printf( "MQTT Disconnected? : Trying to reconnect");
 
     digitalWrite( PIN_ERROR, HIGH );
     delay(2000);
     digitalWrite( PIN_ERROR, LOW );
+
         
     if (!mqtt.connect(MQTT_CLIENTID, MQTT_UID, MQTT_PWD, SERVICETOPIC, 1, false, SERVICE_DEAD, false )) {
       mqttErrorCount++; 
@@ -382,6 +482,9 @@ void loop() {
  #ifdef INCLUDE_LORA
   onReceive(LoRa.parsePacket());
  #endif  
+
+   updateDisplay();
+
 }
 
 void sendMessage(String outgoing) {
@@ -401,7 +504,7 @@ void sendMessage(String outgoing) {
 }
 
 void onReceive(int packetSize) {
- #ifdef INCLUDE_LORA
+
   if (packetSize == 0) return;          // if there's no packet, return
 
   byte messageLength = LoRa.read();    // incoming msg length
@@ -413,7 +516,13 @@ void onReceive(int packetSize) {
   }
 
   // we got a message
-  infoLog->printf("Message received. RSSI(%s dB), SNR(%s dB)\n", String(LoRa.packetRssi()), String(LoRa.packetSnr()) );
+  char msg[255];
+  sprintf(msg, "Lora Message received. RSSI(%s dB), SNR(%s dB)\n", String(LoRa.packetRssi()), String(LoRa.packetSnr()) );
+  infoLog->printf(msg);
+  infoLog->print(incoming);
+  // and to console....
+  Serial.println(msg);
+  Serial.println(incoming);  
   
   // assume incomming is encrypted
   // Decrypt
@@ -423,14 +532,14 @@ void onReceive(int packetSize) {
 
   if (messageLength != decrypted_len) {  // check length for error
     warningLog->printf("warning: message length does not match length: %d. Decrypted Len was %d. Truncating\n", messageLength, decrypted_len);
-    if (decrypted_len>messageLength) 
-    {
-      cleartext[messageLength] = '\0';
-    }
+    //if (decrypted_len>messageLength) 
+    //{
+    //  cleartext[messageLength] = '\0';
+    //}
     //return;       
   }
 
-  infoLog->printf( "Lora Message Received: \"%s\"\n", cleartext );
+  infoLog->printf( "Decrypted Lora Message Received: \"%s\"\n", cleartext );
 
   DynamicJsonDocument jsonBuffer(512);
   DeserializationError error = deserializeJson(jsonBuffer, cleartext); 
@@ -456,7 +565,7 @@ void onReceive(int packetSize) {
   digitalWrite(PIN_ACTIVITY, LOW );
 
   // if message is for this device, or broadcast, print details:
-  // infoLog->printf( "Lora Message Received: \"%s\"\n", cleartext );
+  infoLog->printf( "Lora Message Received: \"%s\"\n", cleartext );
 
   // Now sent message through MQTT
   char jsonChar[512];
@@ -466,6 +575,9 @@ void onReceive(int packetSize) {
   infoLog->printf( "Sending MQTT Message=\"%s\"\n", jsonChar );
 
   int status = publishMQTT( SENDTOPIC, jsonChar ); // this will also flash the activity light
+
+   os_lastAction = "LoRa Received";
+   os_Detail1 = "Rssi=" + String(LoRa.packetRssi()) + " Snr=" + String(LoRa.packetSnr());
+   os_Detail2 = getClock();
  
- #endif
 }

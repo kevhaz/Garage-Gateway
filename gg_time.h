@@ -39,10 +39,21 @@ void time_setup()
   setSyncInterval(15); // sync every 15 seconds
   setSyncProvider(getNtpTime);
 
-  while(timeStatus()== timeNotSet)
-    ; // wait until the time is set by the sync provider
+  bool timesetup = false;
+  long stime = millis();
+  while(timeStatus()==timeNotSet && (millis() - stime) < 10000 )
+    ; // wait until the time is set by the sync provider, or 10 seconds max
 
-  Serial.println("Time Sync successfully");
+  timesetup = !(timeStatus()==timeNotSet) ;
+
+  if (!timesetup) {
+    setSyncProvider((getExternalTime)0);
+    Udp.stop();    
+  }
+
+  char msg[100];
+  sprintf( msg, "Time Sync %s", timesetup?"successful":"failed" );
+  Serial.println(msg);
 }
 
 String getClock()
@@ -117,4 +128,3 @@ void sendNTPpacket(IPAddress &address)
   Udp.write(packetBuffer, NTP_PACKET_SIZE);
   Udp.endPacket();
 }
-
